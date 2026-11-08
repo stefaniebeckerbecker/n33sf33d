@@ -4,6 +4,7 @@ Optional: ANTHROPIC_API_KEY setzen -> Highlights werden von Claude redaktionell 
 import html, json, os, re, sys, urllib.parse, urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime
+from functools import lru_cache
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -11,17 +12,34 @@ from zoneinfo import ZoneInfo
 TOP_FEEDS = [("Tagesschau", "https://www.tagesschau.de/index~rss2.xml"),
              ("Spiegel", "https://www.spiegel.de/schlagzeilen/index.rss"),
              ("DW", "https://rss.dw.com/rdf/rss-de-all")]
-FEEDS = {  # Ressort -> [(Quelle, URL)]  (URLs bitte einmal im Browser prüfen)
-    "Deutschland": [("Tagesschau", "https://www.tagesschau.de/inland/index~rss2.xml"),
-                    ("Spiegel", "https://www.spiegel.de/schlagzeilen/index.rss")],
-    "Welt": [("Tagesschau", "https://www.tagesschau.de/ausland/index~rss2.xml"),
-             ("DW", "https://rss.dw.com/rdf/rss-de-all")],
-    "Wirtschaft": [("Tagesschau", "https://www.tagesschau.de/wirtschaft/index~rss2.xml")],
-    "Tech": [("heise", "https://www.heise.de/rss/heise-atom.xml")],
-}
+TS = "https://www.tagesschau.de"
+GEN = [("Tagesschau", TS + "/index~rss2.xml"), ("Tagesschau", TS + "/inland/index~rss2.xml"),
+       ("Tagesschau", TS + "/ausland/index~rss2.xml"), ("Spiegel", "https://www.spiegel.de/schlagzeilen/index.rss"),
+       ("DW", "https://rss.dw.com/rdf/rss-de-all")]
+# Reihenfolge = Priorität: eine Meldung erscheint nur im ersten passenden Ressort.
+# kw = Stichwort-Filter (Regex) auf Titel+Teaser. URLs bitte einmal im Browser prüfen.
+RESSORTS = [
+    dict(name="Bundesregierung", hue=215, feeds=GEN,
+         kw=r"bundesregierung|\bmerz\b|kanzler|koalition|bundestag|kabinett|bundesminister|klingbeil|wadephul|bundesrat"),
+    dict(name="China", hue=0, feeds=GEN, kw=r"china|chines|peking|xi jinping|taiwan|hongkong|shanghai"),
+    dict(name="Iran", hue=150, feeds=GEN, kw=r"\biran|teheran|hormus"),
+    dict(name="Infos und Ereignisse in Deutschland", nav="Deutschland", hue=45,
+         feeds=[("Tagesschau", TS + "/inland/index~rss2.xml"), ("Spiegel", "https://www.spiegel.de/panorama/index.rss"),
+                ("Spiegel", "https://www.spiegel.de/schlagzeilen/index.rss")]),
+    dict(name="Wissenschaft, Entdeckungen und Raumfahrt", nav="Wissenschaft", hue=270,
+         feeds=[("Spiegel", "https://www.spiegel.de/wissenschaft/index.rss"), ("DW", "https://rss.dw.com/rdf/rss-de-wissen")]),
+    dict(name="Kunst", hue=320,
+         feeds=[("Spiegel", "https://www.spiegel.de/kultur/index.rss"), ("DW", "https://rss.dw.com/rdf/rss-de-kul")]),
+]
+WORLD_FEEDS = [("BBC", "https://feeds.bbci.co.uk/news/world/rss.xml"), ("Guardian", "https://www.theguardian.com/world/rss"),
+               ("Al Jazeera", "https://www.aljazeera.com/xml/rss/all.xml"), ("NYT", "https://rss.nytimes.com/services/xml/rss/nyt/World.xml"),
+               ("France 24", "https://www.france24.com/en/rss"), ("DW English", "https://rss.dw.com/rdf/rss-en-world"),
+               ("Sky News", "https://feeds.skynews.com/feeds/rss/world.xml")]
+EN_STOP = set("says said after over with from will what have more news live world latest about their into amid could would year first "
+              "this that they been were than when where while which also there other against between during under".split())
 YT_CHANNELS = {"tagesschau": "tagesschau", "ZDFheute": "ZDFheute", "DW Deutsch": "dwdeutsch",
                "WELT": "WELTNachrichtensender"}  # Anzeigename -> @Handle (ggf. anpassen)
-PER_SECTION, N_TOP, N_VIDEOS = 8, 7, 12
+PER_SECTION, N_TOP, N_VIDEOS = 6, 7, 12
 TZ = ZoneInfo("Europe/Berlin")
 UA = {"User-Agent": "Mozilla/5.0 news-overview/2.0"}
 
@@ -52,6 +70,7 @@ def entries(source, url):
             out.append({local(c.tag): c for c in el})
     return out
 
+@lru_cache(maxsize=None)
 def fetch(source, url):
     items = []
     for f in entries(source, url):
@@ -120,25 +139,42 @@ def videos():
     return out[:N_VIDEOS]
 
 # ---------- HTML ----------
+NOW = datetime.now(TZ)
 def chat(title, link):
     q = (f"Ich möchte über diesen Nachrichtenartikel sprechen: {title}\n{link}\n\n"
          "Lies den Artikel bitte, fasse ihn kurz zusammen und beantworte danach meine Fragen dazu.")
     return (f'<a class="chat" href="https://claude.ai/new?q={urllib.parse.quote(q)}" target="_blank" rel="noopener">'
-            '💬 Mit Claude besprechen</a>')
+            '💬 Claude befragen</a>')
 
-def card(i):
-    t = i["date"].astimezone(TZ).strftime("%H:%M") if i["date"] else ""
-    s = f'<p>{html.escape(i["summary"])}</p>' if i["summary"] else ""
-    return (f'<article><a href="{html.escape(i["link"])}" rel="noopener">{html.escape(i["title"])}</a>{s}'
-            f'<small>{html.escape(i["source"])}{" · " + t + " Uhr" if t else ""}</small>{chat(i["title"], i["link"])}</article>')
+def meta(i):
+    d = i.get("date")
+    when = ""
+    if d:
+        d = d.astimezone(TZ)
+        when = d.strftime(" · %H:%M Uhr") if d.date() == NOW.date() else d.strftime(" · %d.%m.")
+    return html.escape(i["source"]) + when
 
-def hero(top):
-    if not top: return ""
+def block(bid, title, entries, hue, cls=""):
     li = "".join(
-        f'<li><span class="n">{n}</span><div><a href="{html.escape(t["link"])}" rel="noopener">{html.escape(t["title"])}</a>'
-        f'<p>{html.escape(t["detail"])}</p><small>{html.escape(t["source"])}'
-        f'{" · in " + str(t["cov"]) + " Quellen" if t["cov"] > 1 else ""}</small>{chat(t["title"], t["link"])}</div></li>' for n, t in enumerate(top, 1))
-    return f'<section id="top" class="hero"><h2>Die größten Ereignisse des Tages</h2><ol>{li}</ol></section>'
+        f'<li><span class="n">{n}</span><div><a href="{html.escape(e["link"])}" rel="noopener">{html.escape(e["title"])}</a>'
+        + (f'<p>{html.escape(e["detail"])}</p>' if e.get("detail") else "")
+        + f'<small>{e["meta"]}</small>{chat(e["title"], e["link"])}</div></li>' for n, e in enumerate(entries, 1))
+    li = li or "<li><div><p>Aktuell keine passenden Meldungen gefunden.</p></div></li>"
+    return f'<section id="{bid}" class="blk {cls}" style="--h:{hue}"><h2>{html.escape(title)}</h2><ol>{li}</ol></section>'
+
+def slug(t): return re.sub(r"[^a-z0-9]+", "-", t.lower().replace("ä","ae").replace("ö","oe").replace("ü","ue").replace("ß","ss")).strip("-")
+
+def ressort_items(r, used):
+    items = [i for s, u in r["feeds"] for i in fetch(s, u)]
+    if r.get("kw"): items = [i for i in items if re.search(r["kw"], i["title"] + " " + i["summary"], re.I)]
+    items.sort(key=lambda i: i["date"].timestamp() if i["date"] else 0, reverse=True)
+    out = []
+    for i in items:
+        if i["link"] in used or i["title"] in used: continue
+        used.update((i["link"], i["title"]))
+        out.append(dict(title=i["title"], detail=i["summary"], link=i["link"], meta=meta(i)))
+        if len(out) == PER_SECTION: break
+    return out
 
 def video_block(vs):
     if not vs: return ""
@@ -170,11 +206,15 @@ nav{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px solid
 nav a{color:var(--mu);text-decoration:none;font-weight:600;white-space:nowrap}nav a:hover{color:var(--ac)}
 main{max-width:1100px;margin:0 auto;padding:8px 20px 40px}
 h2{font-family:Georgia,serif;border-left:4px solid var(--ac);padding-left:10px;margin:28px 0 12px}
-.hero{background:linear-gradient(135deg,#1c1917,#431407);color:#fafaf9;border-radius:16px;padding:8px 24px 24px;margin-top:20px}
-.hero h2{border-color:#fb923c;color:#fff}.hero ol{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:18px 28px}
-.hero li{display:flex;gap:14px}.n{font:700 2.2rem/1 Georgia,serif;color:#fb923c;min-width:2rem}
-.hero a{color:#fff;font-weight:700;font-size:1.08rem;text-decoration:none}.hero a:hover{color:#fdba74}
-.hero p{margin:2px 0;color:#d6d3d1;font-size:.93rem}.hero small{color:#fdba74}
+.blk{--h:20;--a:hsl(var(--h) 90% 62%);background:linear-gradient(135deg,hsl(var(--h) 18% 11%),hsl(var(--h) 55% 17%));color:#fafaf9;border-radius:16px;padding:8px 24px 24px;margin-top:20px}
+.blk h2{border-color:var(--a);color:#fff}.blk ol{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:18px 28px}
+.blk li{display:flex;gap:14px}.n{font:700 2.2rem/1 Georgia,serif;color:var(--a);min-width:2rem}
+.blk a{color:#fff;font-weight:700;font-size:1.08rem;text-decoration:none}.blk a:hover{color:hsl(var(--h) 90% 78%)}
+.blk p{margin:2px 0;color:#d6d3d1;font-size:.93rem}.blk small{color:hsl(var(--h) 80% 76%);display:block}
+.blk a.chat{color:var(--a);font-size:.82rem;font-weight:600;display:inline-block;margin-top:4px}
+.blk small a{font-size:.82rem;font-weight:500;text-decoration:underline;color:inherit}
+.blk.world{margin-top:24px;border:2px solid var(--a);padding-bottom:30px}.world ol{grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:22px 32px}
+.world .n{font-size:3.4rem}.world li>div>a:first-child{font-size:1.3rem}.world p{font-size:1rem}
 .vwrap{display:grid;grid-template-columns:2fr 1fr;gap:16px}.stage{aspect-ratio:16/9;background:#000;border-radius:12px;overflow:hidden}
 .stage iframe,.stage #player{width:100%;height:100%;border:0}
 .ctl{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px;color:var(--mu);font-size:.9rem}
@@ -182,14 +222,8 @@ h2{font-family:Georgia,serif;border-left:4px solid var(--ac);padding-left:10px;m
 .list{display:flex;flex-direction:column;gap:8px;max-height:430px;overflow-y:auto}
 .v{display:flex;gap:10px;text-align:left;background:var(--card);color:var(--tx);border:1px solid var(--bd);border-radius:10px;padding:6px;cursor:pointer;font:inherit;flex:none}
 .v img{width:112px;aspect-ratio:16/9;object-fit:cover;border-radius:6px}.v b{font-size:.88rem;line-height:1.25;display:block}.v.on{border-color:var(--ac);box-shadow:0 0 0 2px var(--ac)}
-.v span{display:flex;flex-direction:column;gap:2px}
+.v span{display:flex;flex-direction:column;gap:2px}.v small{color:var(--mu)}
 @media(max-width:800px){.vwrap{grid-template-columns:1fr}.list{flex-direction:row;max-height:none;overflow-x:auto}.v{width:260px}}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px}
-article{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px 16px;display:flex;flex-direction:column;gap:6px}
-article a{color:var(--tx);font-weight:650;text-decoration:none;line-height:1.3}article a:hover{color:var(--ac)}
-article p{margin:0;color:var(--mu);font-size:.92rem}small{color:var(--mu);display:block;margin-top:auto}
-a.chat{font-size:.82rem;font-weight:600!important;color:var(--ac)!important;margin-top:4px;display:inline-block}
-.hero a.chat{color:#fdba74!important;font-size:.82rem;font-weight:600}
 footer{text-align:center;color:var(--mu);padding:20px;font-size:.85rem}
 </style></head><body>
 <header><h1>Nachrichten-Überblick</h1><p>__DATE__ · aktualisiert um __TIME__ Uhr</p></header>
@@ -197,31 +231,81 @@ footer{text-align:center;color:var(--mu);padding:20px;font-size:.85rem}
 <footer>Schlagzeilen aus den öffentlichen RSS-Feeds der genannten Quellen, Videos von YouTube – Klick führt zum Original.</footer>
 __SCRIPT__</body></html>"""
 
+# ---------- Die 3 wichtigsten Ereignisse weltweit ----------
+def en_words(t): return {w for w in re.findall(r"[a-z]{4,}", t.lower()) if w not in EN_STOP}
+def related(a, b):
+    x = a["w"] & b["w"]
+    return len(x) >= 2 and len(x) / len(a["w"] | b["w"]) >= 0.2
+
+def claude_text(prompt):
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key: return None
+    body = json.dumps({"model": "claude-sonnet-5-5", "max_tokens": 1000, "messages": [{"role": "user", "content": prompt}]}).encode()
+    req = urllib.request.Request("https://api.anthropic.com/v1/messages", body, {
+        "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"})
+    try: return json.load(urllib.request.urlopen(req, timeout=90))["content"][0]["text"]
+    except Exception as e:
+        print("WARNUNG Claude:", e, file=sys.stderr); return None
+
+def world_top():
+    """Die 3 Themen, über die die meisten internationalen Quellen berichten."""
+    cutoff = NOW.timestamp() - 36 * 3600
+    items = []
+    for src, url in WORLD_FEEDS:
+        for pos, i in enumerate(fetch(src, url)[:20]):
+            if i["date"] and i["date"].timestamp() < cutoff: continue
+            items.append(dict(i, pos=pos, w=en_words(i["title"] + " " + i["summary"])))
+    clusters = []
+    for _ in range(3):
+        best = None
+        for a in items:
+            grp = {}
+            for b in sorted(items, key=lambda b: b["pos"]):
+                if (b is a or (b["source"] != a["source"] and related(a, b))) and b["source"] not in grp: grp[b["source"]] = b
+            key = (len(grp), -a["pos"])
+            if best is None or key > best[0]: best = (key, a, list(grp.values()))
+        if not best or best[0][0] < 2: break
+        _, seed, grp = best
+        clusters.append((seed, grp))
+        items = [i for i in items if not related(seed, i) and i is not seed]
+    de = None
+    txt = claude_text("Fasse diese 3 Weltthemen auf Deutsch zusammen. Antworte NUR mit JSON-Array in gleicher Reihenfolge aus Objekten "
+                      '{"titel": max. 8 Wörter, "detail": ein sachlicher Satz}. Nutze nur Fakten aus den Meldungen.\n\n'
+                      + "\n\n".join(f"Thema {n}:\n" + "\n".join(f"- {g['title']}: {g['summary']}" for g in grp)
+                                    for n, (_, grp) in enumerate(clusters, 1))) if clusters else None
+    try: de = json.loads(re.search(r"\[.*\]", txt, re.S).group(0)) if txt else None
+    except Exception: de = None
+    out = []
+    for n, (seed, grp) in enumerate(clusters):
+        links = " · ".join(f'<a href="{html.escape(g["link"])}" rel="noopener">{html.escape(g["source"])}</a>' for g in grp)
+        ok = de and n < len(de)
+        out.append(dict(title=de[n]["titel"] if ok else seed["title"], detail=de[n]["detail"] if ok else seed["summary"],
+                        link=seed["link"], meta=f"Weltweit in {len(grp)} Quellen: {links}" + ("" if ok else " (Originaltitel englisch)")))
+    return out
+
 def main():
     pool = top_pool()
     top = ai_top(pool) or heuristic_top(pool)
+    world = world_top()
     vids = videos()
-    data = {}
-    for sec, feeds in FEEDS.items():
-        seen, items = set(), []
-        for s, u in feeds: items += fetch(s, u)
-        items.sort(key=lambda i: i["date"].timestamp() if i["date"] else 0, reverse=True)
-        data[sec] = [i for i in items if not (i["title"] in seen or seen.add(i["title"]))][:PER_SECTION]
-    now = datetime.now(TZ)
-    names = (["Top"] if top else []) + (["Videos"] if vids else []) + list(data)
-    nav = "".join(f'<a href="#{n.lower()}">{n}</a>' for n in names)
-    body = hero(top) + video_block(vids) + "".join(
-        f'<section id="{s.lower()}"><h2>{s}</h2><div class="grid">'
-        + ("".join(card(i) for i in items) or "<p>Aktuell keine Meldungen abrufbar.</p>") + "</div></section>"
-        for s, items in data.items())
+    used, secs = set(), []
+    for r in RESSORTS:
+        secs.append((r, ressort_items(r, used)))
+    nav_items = ([("welt", "Top 3 weltweit")] if world else []) + ([("top", "Top")] if top else []) + ([("videos", "Videos")] if vids else []) \
+        + [(slug(r["name"]), r.get("nav", r["name"])) for r, _ in secs]
+    nav = "".join(f'<a href="#{i}">{n}</a>' for i, n in nav_items)
+    top_entries = [dict(title=t["title"], detail=t["detail"], link=t["link"],
+                        meta=html.escape(t["source"]) + (f" · in {t['cov']} Quellen" if t["cov"] > 1 else "")) for t in top]
+    body = (block("welt", "Die 3 wichtigsten Ereignisse des Tages", world, 48, "world") if world else "") + (block("top", "Mehr Top-Meldungen aus Deutschland", top_entries, 20) if top else "") + video_block(vids) \
+        + "".join(block(slug(r["name"]), r["name"], items, r["hue"]) for r, items in secs)
     script = ""
     if vids:
         j = json.dumps([{"id": v["id"]} for v in vids]).replace("</", "<\\/")
         script = "<script>" + JS.replace("__V__", j) + "</script>"
-    page = (PAGE.replace("__DATE__", now.strftime("%d.%m.%Y")).replace("__TIME__", now.strftime("%H:%M"))
+    page = (PAGE.replace("__DATE__", NOW.strftime("%d.%m.%Y")).replace("__TIME__", NOW.strftime("%H:%M"))
             .replace("__NAV__", nav).replace("__BODY__", body).replace("__SCRIPT__", script))
     Path("docs").mkdir(exist_ok=True)
     Path("docs/index.html").write_text(page, encoding="utf-8")
-    print("docs/index.html:", len(top), "Highlights,", len(vids), "Videos,", {s: len(v) for s, v in data.items()})
+    print("docs/index.html:", len(world), "Weltthemen,", len(top), "Highlights,", len(vids), "Videos,", {r["name"]: len(i) for r, i in secs})
 
 if __name__ == "__main__": main()
