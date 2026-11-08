@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Erzeugt docs/index.html: Tages-Highlights, YouTube-Playlist, Ressorts. Nur Standardbibliothek.
 Optional: ANTHROPIC_API_KEY setzen -> Highlights werden von Claude redaktionell zusammengefasst."""
-import html, json, os, re, sys, urllib.request
+import html, json, os, re, sys, urllib.parse, urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from email.utils import parsedate_to_datetime
@@ -120,18 +120,24 @@ def videos():
     return out[:N_VIDEOS]
 
 # ---------- HTML ----------
+def chat(title, link):
+    q = (f"Ich möchte über diesen Nachrichtenartikel sprechen: {title}\n{link}\n\n"
+         "Lies den Artikel bitte, fasse ihn kurz zusammen und beantworte danach meine Fragen dazu.")
+    return (f'<a class="chat" href="https://claude.ai/new?q={urllib.parse.quote(q)}" target="_blank" rel="noopener">'
+            '💬 Mit Claude besprechen</a>')
+
 def card(i):
     t = i["date"].astimezone(TZ).strftime("%H:%M") if i["date"] else ""
     s = f'<p>{html.escape(i["summary"])}</p>' if i["summary"] else ""
     return (f'<article><a href="{html.escape(i["link"])}" rel="noopener">{html.escape(i["title"])}</a>{s}'
-            f'<small>{html.escape(i["source"])}{" · " + t + " Uhr" if t else ""}</small></article>')
+            f'<small>{html.escape(i["source"])}{" · " + t + " Uhr" if t else ""}</small>{chat(i["title"], i["link"])}</article>')
 
 def hero(top):
     if not top: return ""
     li = "".join(
         f'<li><span class="n">{n}</span><div><a href="{html.escape(t["link"])}" rel="noopener">{html.escape(t["title"])}</a>'
         f'<p>{html.escape(t["detail"])}</p><small>{html.escape(t["source"])}'
-        f'{" · in " + str(t["cov"]) + " Quellen" if t["cov"] > 1 else ""}</small></div></li>' for n, t in enumerate(top, 1))
+        f'{" · in " + str(t["cov"]) + " Quellen" if t["cov"] > 1 else ""}</small>{chat(t["title"], t["link"])}</div></li>' for n, t in enumerate(top, 1))
     return f'<section id="top" class="hero"><h2>Die größten Ereignisse des Tages</h2><ol>{li}</ol></section>'
 
 def video_block(vs):
@@ -182,6 +188,8 @@ h2{font-family:Georgia,serif;border-left:4px solid var(--ac);padding-left:10px;m
 article{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px 16px;display:flex;flex-direction:column;gap:6px}
 article a{color:var(--tx);font-weight:650;text-decoration:none;line-height:1.3}article a:hover{color:var(--ac)}
 article p{margin:0;color:var(--mu);font-size:.92rem}small{color:var(--mu);display:block;margin-top:auto}
+a.chat{font-size:.82rem;font-weight:600!important;color:var(--ac)!important;margin-top:4px;display:inline-block}
+.hero a.chat{color:#fdba74!important;font-size:.82rem;font-weight:600}
 footer{text-align:center;color:var(--mu);padding:20px;font-size:.85rem}
 </style></head><body>
 <header><h1>Nachrichten-Überblick</h1><p>__DATE__ · aktualisiert um __TIME__ Uhr</p></header>
